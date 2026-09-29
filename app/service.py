@@ -5,6 +5,11 @@ from __future__ import annotations
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
 from .audit import AuditEntry, audit_manifests
 from .disk_peak import simulate_disk_peak
+from .hardlink import (
+    HARDLINK_TYPE,
+    HardlinkBlockReason,
+    plan_hardlinks,
+)
 from .mirror import MirrorOperation, plan_mirror
 from .relocation import (
     RelocationConflictType,
@@ -32,6 +37,12 @@ from .schemas import (
     DiskPeakPreviewResponse,
     DiskPeakSummary,
     EntryType,
+    HardlinkBlockReasonOut,
+    HardlinkChainNodeOut,
+    HardlinkEntryOut,
+    HardlinkPreviewRequest,
+    HardlinkPreviewResponse,
+    HardlinkSummary,
     HierarchyConflict,
     ManifestAmbiguousKeyOut,
     ManifestAuditEntryOut,
@@ -819,4 +830,99 @@ def run_relocation_preview(
     )
     return RelocationPreviewResponse(
         target="windows", entries=entries_out, summary=summary
+    )
+
+
+def run_hardlink_preview(
+    request: HardlinkPreviewRequest,
+) -> HardlinkPreviewResponse:
+    """含硬链接解包清单的落盘前预演：阻断判定、目标链与可执行顺序（纯内存）。
+
+    条目路径与硬链接目标均复用 Windows 规范化；任何清单问题（不安全路径、
+    同键重复、叶子祖先、目标缺失/为目录/成环/被阻断等）都不返回 422，而在
+    逐条结果中给出阻断原因——只有结构性的请求错误（hardlink 缺 target、
+    其余类型带 target）由 schema 层以 422 拒绝。
+    """
+    normalized = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.entries, start=1)
+    ]
+    link_targets = {
+        i: e.target
+        for i, e in enumerate(request.entries, start=1)
+        if e.type.value == HARDLINK_TYPE
+    }
+    plan = plan_hardlinks(normalized, link_targets)
+
+    entries_out: list[HardlinkEntryOut] = []
+    for planned, entry in zip(plan.entries, normalized):
+        entries_out.append(
+            HardlinkEntryOut(
+                index=planned.index,
+                type=planned.entry_type,
+                original_path=planned.original_path,
+                target=planned.link_target,
+                canonical_path=planned.canonical_path,
+                comparison_key=planned.comparison_key,
+                safe=planned.safe,
+                resolved_target_path=planned.resolved_target_path,
+                status=planned.status,
+                primary_block_reason=planned.primary_block_reason,
+                block_reasons=[
+                    HardlinkBlockReasonOut(
+                        reason=reason,
+                        related_indices=planned.related_indices_by_reason.get(
+                            reason, []
+                        ),
+                    )
+                    for reason in planned.block_reasons
+                ],
+                target_chain=[
+                    HardlinkChainNodeOut(
+                        index=node.index, canonical_path=node.canonical_path
+                    )
+                    for node in planned.target_chain
+                ],
+                final_file_index=planned.final_file_index,
+                execution_order=planned.execution_order,
+                issues=[
+                    {
+                        "code": issue.code,
+                        "severity": issue.severity,
+                        "message": issue.message,
+                        "segment": issue.segment,
+                        "related_index": issue.related_index,
+                    }
+                    for issue in entry.issues
+                ],
+            )
+        )
+
+    reason_counts = {reason: 0 for reason in HardlinkBlockReason}
+    blocked = 0
+    for planned in plan.entries:
+        if planned.block_reasons:
+            blocked += 1
+        for reason in planned.block_reasons:
+            reason_counts[reason] += 1
+    type_counts = {"file": 0, "directory": 0, "hardlink": 0}
+    for entry in normalized:
+        type_counts[entry.entry_type] += 1
+
+    summary = HardlinkSummary(
+        total=len(plan.entries),
+        files=type_counts["file"],
+        directories=type_counts["directory"],
+        hardlinks=type_counts["hardlink"],
+        executable=len(plan.execution_order),
+        blocked=blocked,
+        blocked_by_reason={
+            reason: count for reason, count in reason_counts.items() if count
+        },
+    )
+    return HardlinkPreviewResponse(
+        target="windows",
+        entries=entries_out,
+        execution_order=plan.execution_order,
+        summary=summary,
     )

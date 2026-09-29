@@ -10,6 +10,8 @@ from fastapi import FastAPI
 from .schemas import (
     DiskPeakPreviewRequest,
     DiskPeakPreviewResponse,
+    HardlinkPreviewRequest,
+    HardlinkPreviewResponse,
     HealthResponse,
     ManifestAuditRequest,
     ManifestAuditResponse,
@@ -26,6 +28,7 @@ from .schemas import (
 )
 from .service import (
     run_disk_peak_preview,
+    run_hardlink_preview,
     run_manifest_audit,
     run_mirror_preview,
     run_overlay_preview,
@@ -54,10 +57,12 @@ app = FastAPI(
         "删除新建目录）；磁盘暂存峰值预演（给定现存清单、按序解包清单与初始"
         "可用字节数，模拟同盘备份一次、先暂存新文件再替换释放旧占用的空间曲线，"
         "逐条给出暂存峰值与提交后新增占用、整批峰值及首次超额阶段与条目，"
-        "超额也继续预演）。"
+        "超额也继续预演）；硬链接解包预演（file/directory/hardlink 清单在落盘前"
+        "纯内存判定阻断原因、逐级追踪硬链接目标链至最终普通文件，并按每步取"
+        "依赖已满足者中原下标最小的规则给出可执行条目执行顺序）。"
         "纯内存计算，不访问文件系统。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -79,6 +84,7 @@ def root() -> dict[str, str]:
         "relocation_preview": "POST /api/v1/relocation-preview",
         "rollback_preview": "POST /api/v1/rollback-preview",
         "disk_peak_preview": "POST /api/v1/disk-peak-preview",
+        "hardlink_preview": "POST /api/v1/hardlink-preview",
     }
 
 
@@ -154,3 +160,16 @@ def relocation_preview(request: RelocationPreviewRequest) -> RelocationPreviewRe
 )
 def rollback_preview(request: RollbackPreviewRequest) -> RollbackPreviewResponse:
     return run_rollback_preview(request)
+
+
+@app.post(
+    "/api/v1/hardlink-preview",
+    response_model=HardlinkPreviewResponse,
+    tags=["hardlink"],
+    summary=(
+        "硬链接解包预演：落盘前逐条判定阻断原因、追踪目标链至最终普通文件，"
+        "并按依赖规则排定可执行条目顺序（纯内存）"
+    ),
+)
+def hardlink_preview(request: HardlinkPreviewRequest) -> HardlinkPreviewResponse:
+    return run_hardlink_preview(request)
