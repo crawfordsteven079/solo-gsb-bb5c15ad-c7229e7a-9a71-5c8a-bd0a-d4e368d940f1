@@ -25,7 +25,13 @@
 以及**路径重定位预演**接口：给定 `file`/`directory` 条目与按顺序排列的
 源前缀→目标前缀规则，按规范化路径段的比较键做前缀匹配改写路径
 （最长源前缀优先、同长度取最后一条，未命中保留原路径），并预检重定位结果中的
-同键重复与文件占据祖先路径冲突，逐条给出可用状态。
+同键重复与文件占据祖先路径冲突，逐条给出可用状态；
+另有**硬链接解包顺序预演**接口：接收按原顺序排列的 `file` / `directory` /
+`hardlink` 条目（hardlink 必带归档根相对目标，其余类型不得带），允许硬链接
+指向后续条目并沿目标链逐级追踪至普通文件，逐条给出阻断原因（路径不安全、
+同键重复、文件/硬链接占据祖先路径、目标缺失、目标为目录、目标链成环、
+目标被阻断），并按“依赖已满足者中原下标最小”排定落盘执行顺序，逐条返回
+状态、目标链、最终普通文件下标与执行序号。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -618,6 +624,90 @@ curl -s http://localhost:8000/api/v1/relocation-preview \
 上例中 `old/docs/a.txt` 命中规则被改写为 `new/home/a.txt`
 （`matched_rule_index` 为 0），`keep.txt` 未命中保留原路径，两条均可用。
 
+### `POST /api/v1/hardlink-order`
+
+硬链接解包顺序预演：接收按归档**原顺序**排列的 `file` / `directory` /
+`hardlink` 条目，在**落盘前**纯内存判定每条目是否可执行并排定执行顺序。
+全程不访问文件系统。`hardlink` 条目**必须**携带归档根相对的 `target`，
+`file` / `directory` **不得**携带（否则返回 422）；`target` 为空串合法
+（以空目标不安全逐条阻断，不返回 422）。
+
+- **路径规范化**：条目路径与硬链接目标均复用与预检接口相同的 Windows
+  规范化规则（分隔符统一、NFC、段尾裁剪、保留名/非法字符检查、词法遍历），
+  比较键为 `casefold` 折叠后的规范路径。与符号链接不同，硬链接目标是
+  **归档根相对**路径（**不**相对链接所在目录解析）：`../x` 即越界。
+  条目路径不安全、目标路径不安全等都**逐条报告阻断原因**（不返回 422）。
+- **同键重复（`DUPLICATE_KEY`）**：规范化后同键的多条条目互相阻断
+  （file/directory/hardlink 不分类型），每条给出其余成员下标。
+- **文件/硬链接占据祖先路径（`BLOCKED_BY_FILE_ANCESTOR`）**：某条目的
+  祖先路径被 file 或 hardlink 条目占据时该后代阻断，给出占据者下标；
+  目录占据祖先属于正常布局，不阻断。
+- **目标链追踪**：从每条 hardlink 的目标键开始，命中 hardlink 时继续
+  跟随（比较键匹配，允许指向**后续条目**、允许多级链），直至普通文件。
+  - 目标键在清单中无任何条目 → `TARGET_MISSING`；
+  - 目标字符串规范化不安全（绝对/UNC/盘符、越界 `..`、保留名、非法字符、空段等）
+    → `TARGET_UNSAFE`；
+  - 目标同键存在多条条目（同键重复，无法唯一解析）→ fail-closed，
+    `TARGET_BLOCKED` 且 `related_indices` 给出全部候选；
+  - 链终点是目录 → `TARGET_IS_DIRECTORY`（硬链接只能指向普通文件）；
+  - 链中再次遇到已访问的硬链接 → 成环，环上每条 hardlink 记 `TARGET_CYCLE`
+    （`cycles` 去重列出，从最小下标旋转）；
+  - 直接目标（含链上中间 hardlink）因上述任一原因被阻断时，引用它的
+    hardlink 记 `TARGET_BLOCKED` 并给出直接被阻断条目的下标，**阻断沿链
+    逐级传播**（先下游、后上游）。
+- **执行顺序**：被阻断条目不参与；可执行条目里 `file` / `directory` 无
+  依赖，`hardlink` 依赖其**直接目标条目**（链的第一跳）。每一步在“依赖
+  已满足”的可执行条目中取**原下标最小**者执行；因此指向后续文件的硬链接
+  会自然排在该文件之后，多级链按深度展开，同深度按下标。
+
+请求体示例：
+
+```json
+{
+  "entries": [
+    { "path": "bin/v1", "type": "hardlink", "target": "bin/v2" },
+    { "path": "bin/v2", "type": "hardlink", "target": "bin/current/app.exe" },
+    { "path": "bin/current", "type": "directory" },
+    { "path": "bin/current/app.exe", "type": "file" },
+    { "path": "bad", "type": "hardlink", "target": "missing/file" },
+    { "path": "loop1", "type": "hardlink", "target": "loop2" },
+    { "path": "loop2", "type": "hardlink", "target": "loop1" }
+  ]
+}
+```
+
+响应中 `entries` **严格保持输入顺序**，`index` 从 1 开始：
+
+| 字段 | 说明 |
+| --- | --- |
+| `entries[].canonical_path` / `comparison_key` | 条目路径规范化结果与 Windows 比较键（不安全时 `comparison_key` 可能为 `null`） |
+| `entries[].target` / `target_canonical_path` | 硬链接原始目标与目标规范化尽力结果（非 hardlink 为 `null`） |
+| `entries[].status` | `EXECUTABLE`（可落盘）或 `BLOCKED`（被阻断，不进入执行顺序） |
+| `entries[].blocks[]` | 逐条阻断原因，含 `code`、人类可读 `message` 与 `related_indices`（相关条目原下标，升序）；按固定代码顺序排列，可同时含多项 |
+| `entries[].target_chain[]` | 目标链：从直接目标开始逐级经过的条目（`step` 从 1 开始，含 `index`/`type`/`canonical_path`）；成环时含一次重复点以闭合环；目标缺失/目标不安全/同键多候选时为空；非 hardlink 恒为空 |
+| `entries[].final_file_index` | 链追踪到的最终普通文件下标：可执行 file 为自身，可执行 hardlink 为链终点文件；阻断时为 `null` |
+| `entries[].execution_order` | 执行序号（从 1 开始）；被阻断条目为 `null` |
+| `cycles[]` | 检测到的目标链环，每条 `members` 为从最小下标开始按链顺序排列的环上硬链接下标；整体按最小成员升序 |
+| `execution_order[]` | 可执行条目的执行顺序（原下标列表，位次即各条目的执行序号） |
+| `summary` | `total/files/directories/hardlinks`、`executable/blocked`、分类型的可执行计数与 `cycles` 环数 |
+
+阻断代码一览：`UNSAFE_PATH`（自身路径不安全）、`DUPLICATE_KEY`（同键重复）、
+`BLOCKED_BY_FILE_ANCESTOR`（祖先被文件/硬链接占据）、`TARGET_UNSAFE`
+（目标不是安全的归档根相对路径）、`TARGET_MISSING`（目标缺失）、
+`TARGET_IS_DIRECTORY`（目标链终点为目录）、`TARGET_CYCLE`（目标链成环）、
+`TARGET_BLOCKED`（直接目标/链上条目被阻断，或目标同键多候选，沿链传播）。
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/hardlink-order \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[{"path":"h","type":"hardlink","target":"f.txt"},{"path":"f.txt","type":"file"}]}'
+```
+
+上例中 `f.txt`（#2）先执行（执行序号 1），硬链接 `h`（#1）等待其直接目标
+落盘后执行（序号 2），`final_file_index` 为 2，`execution_order` 为 `[2, 1]`。
+
 ## 规范化规则（Windows 目标）
 
 1. **统一分隔符**：`\` 与 `/` 均视为路径分隔符，输出统一为 `/`。
@@ -908,10 +998,10 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/disk-peak-preview、/api/v1/rollback-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/disk-peak-preview、/api/v1/rollback-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview、/api/v1/hardlink-order）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、disk-peak-preview、rollback-preview、mirror-preview、manifest-audit、relocation-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、磁盘暂存峰值预演、前缀回退预演、镜像同步预演、清单核对与重定位预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、disk-peak-preview、rollback-preview、mirror-preview、manifest-audit、relocation-preview、hardlink-order）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、磁盘暂存峰值预演、前缀回退预演、镜像同步预演、清单核对、重定位预演与硬链接顺序预演编排
 │   ├── audit.py         # 清单核对：缺失/额外/类型不符/摘要不符/一致、层级阻挡与同键歧义（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
@@ -921,6 +1011,7 @@ curl -s http://localhost:8000/api/v1/preflight \
 │   ├── rollback.py      # 前缀解包回退预演：执行前备份清单与删文件/恢复/深→浅删目录三阶段回退步骤（纯函数）
 │   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
 │   ├── relocation.py    # 路径重定位预演：源前缀→目标前缀改写与结果冲突检测（纯函数）
+│   ├── hardlink.py      # 硬链接解包顺序预演：目标链追踪、逐条阻断/传播与依赖排序（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务

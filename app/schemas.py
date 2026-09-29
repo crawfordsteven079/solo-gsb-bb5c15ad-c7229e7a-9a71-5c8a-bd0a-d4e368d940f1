@@ -11,6 +11,7 @@ from .normalize import IssueCode, IssueSeverity, normalize_entry
 from .mirror import MirrorOperation
 from .audit import AuditStatus, ManifestSide
 from .relocation import RelocationConflictType
+from .hardlink import HardlinkBlockCode, HardlinkEntryType, HardlinkStatus
 from .overlay import (
     OverlayBlockReason,
     OverlayNodeSource,
@@ -1117,3 +1118,148 @@ class RelocationPreviewResponse(BaseModel):
         ..., description="按输入顺序逐条给出重定位结果与冲突明细"
     )
     summary: RelocationSummary
+
+
+# ---------------------------------------------------------------------------
+# hardlink-order：硬链接解包顺序预演
+# ---------------------------------------------------------------------------
+
+
+class HardlinkEntryIn(BaseModel):
+    path: str = Field(..., description="待落盘条目的原始路径")
+    type: HardlinkEntryType = Field(
+        ..., description="条目类型：file、directory 或 hardlink"
+    )
+    target: str | None = Field(
+        default=None,
+        description=(
+            "归档根相对目标路径：type 为 hardlink 时必填（可为空串，空串按"
+            "不安全路径逐条阻断）；file/directory 不得携带，否则返回 422"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> "HardlinkEntryIn":
+        if self.type is HardlinkEntryType.HARDLINK:
+            if self.target is None:
+                raise ValueError("type 为 hardlink 时必须提供归档根相对 target")
+        elif self.target is not None:
+            raise ValueError("仅 hardlink 条目可携带 target")
+        return self
+
+
+class HardlinkOrderRequest(BaseModel):
+    """硬链接解包顺序预演请求：按原顺序排列的 file/directory/hardlink 条目。"""
+
+    entries: list[HardlinkEntryIn] = Field(
+        ..., min_length=1, description="按归档原顺序排列的条目列表（至少 1 条）"
+    )
+
+
+class HardlinkBlockOut(BaseModel):
+    code: HardlinkBlockCode = Field(
+        ...,
+        description=(
+            "阻断原因：UNSAFE_PATH（条目自身路径不安全）、DUPLICATE_KEY（同键重复）、"
+            "BLOCKED_BY_FILE_ANCESTOR（祖先路径被文件/硬链接占据）、"
+            "TARGET_UNSAFE（硬链接目标不是安全的归档根相对路径）、"
+            "TARGET_MISSING（目标在清单中缺失）、TARGET_IS_DIRECTORY（目标链终点为目录）、"
+            "TARGET_CYCLE（目标链成环）、TARGET_BLOCKED（目标/链上条目被阻断，"
+            "或目标同键多候选无法唯一解析，阻断沿链传播）"
+        ),
+    )
+    message: str = Field(..., description="人类可读的阻断说明")
+    related_indices: list[int] = Field(
+        default_factory=list,
+        description="相关条目原下标（从 1 开始，升序）：同键重复成员、祖先占据者或被阻断的链上条目",
+    )
+
+
+class HardlinkChainStepOut(BaseModel):
+    step: int = Field(..., description="目标链中的步数（从 1 开始）")
+    index: int = Field(..., description="该步命中的清单条目下标（从 1 开始）")
+    type: HardlinkEntryType = Field(..., description="该步条目类型：file、directory 或 hardlink")
+    canonical_path: str = Field(..., description="该步条目的规范路径（正斜杠分隔）")
+
+
+class HardlinkOrderEntryOut(BaseModel):
+    index: int = Field(..., description="条目下标（从 1 开始，与输入顺序一致）")
+    type: HardlinkEntryType
+    original_path: str = Field(..., description="原始输入路径")
+    target: str | None = Field(
+        ..., description="硬链接的原始归档根相对目标；非 hardlink 条目为 null"
+    )
+    canonical_path: str = Field(
+        ..., description="规范化路径（NFC、段尾已裁剪，正斜杠分隔）；路径不安全时为尽力结果"
+    )
+    target_canonical_path: str | None = Field(
+        ...,
+        description=(
+            "硬链接目标按归档根相对规范化后的尽力结果（正斜杠分隔）；"
+            "非 hardlink 条目为 null"
+        ),
+    )
+    comparison_key: str | None = Field(
+        ..., description="Windows 等价比较键（小写折叠）；路径不安全或有效段为空时为 null"
+    )
+    status: HardlinkStatus = Field(
+        ..., description="EXECUTABLE（可落盘）或 BLOCKED（被阻断，不进入执行顺序）"
+    )
+    blocks: list[HardlinkBlockOut] = Field(
+        default_factory=list,
+        description="逐条阻断原因（按固定代码顺序排列）；EXECUTABLE 时为空列表",
+    )
+    target_chain: list[HardlinkChainStepOut] = Field(
+        default_factory=list,
+        description=(
+            "硬链接目标链：从直接目标开始逐级经过的条目（含重复点以闭合环）；"
+            "目标缺失/目标不安全时为空列表；非 hardlink 条目恒为空列表"
+        ),
+    )
+    final_file_index: int | None = Field(
+        ...,
+        description=(
+            "目标链逐级追踪到的最终普通文件下标：可执行 file 为自身下标，"
+            "可执行 hardlink 为链终点文件下标；其余情况为 null"
+        ),
+    )
+    execution_order: int | None = Field(
+        ..., description="执行序号（从 1 开始）；被阻断条目为 null"
+    )
+
+
+class HardlinkCycleOut(BaseModel):
+    members: list[int] = Field(
+        ..., description="构成目标链环的硬链接条目下标（从最小下标开始，按链顺序）"
+    )
+
+
+class HardlinkOrderSummary(BaseModel):
+    total: int = Field(..., description="条目总数")
+    files: int = Field(..., description="file 条目数")
+    directories: int = Field(..., description="directory 条目数")
+    hardlinks: int = Field(..., description="hardlink 条目数")
+    executable: int = Field(..., description="可执行条目数（进入执行顺序）")
+    blocked: int = Field(..., description="被阻断条目数")
+    executable_files: int = Field(..., description="可执行 file 条目数")
+    executable_directories: int = Field(..., description="可执行 directory 条目数")
+    executable_hardlinks: int = Field(..., description="可执行 hardlink 条目数")
+    cycles: int = Field(..., description="检测到的硬链接目标链环数")
+
+
+class HardlinkOrderResponse(BaseModel):
+    target: str = "windows"
+    entries: list[HardlinkOrderEntryOut] = Field(
+        ..., description="逐条状态、阻断原因、目标链、最终文件下标与执行序号（按输入顺序）"
+    )
+    cycles: list[HardlinkCycleOut] = Field(
+        ..., description="检测到的目标链环（按最小成员下标升序）"
+    )
+    execution_order: list[int] = Field(
+        ...,
+        description=(
+            "可执行条目的执行顺序（原下标列表，从 1 起的位次即执行序号）："
+            "每步在依赖已满足者中取原下标最小者，hardlink 排在其直接目标之后"
+        ),
+    )
+    summary: HardlinkOrderSummary

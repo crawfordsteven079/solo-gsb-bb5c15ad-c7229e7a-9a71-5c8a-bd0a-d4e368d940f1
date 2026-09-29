@@ -5,6 +5,15 @@ from __future__ import annotations
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
 from .audit import AuditEntry, audit_manifests
 from .disk_peak import simulate_disk_peak
+from .hardlink import (
+    HARDLINK_TYPE,
+    DIR_TYPE,
+    FILE_TYPE,
+    BLOCK_CODE_ORDER,
+    HardlinkEntryType,
+    HardlinkStatus,
+    plan_hardlink_order,
+)
 from .mirror import MirrorOperation, plan_mirror
 from .relocation import (
     RelocationConflictType,
@@ -32,6 +41,13 @@ from .schemas import (
     DiskPeakPreviewResponse,
     DiskPeakSummary,
     EntryType,
+    HardlinkBlockOut,
+    HardlinkChainStepOut,
+    HardlinkCycleOut,
+    HardlinkOrderEntryOut,
+    HardlinkOrderRequest,
+    HardlinkOrderResponse,
+    HardlinkOrderSummary,
     HierarchyConflict,
     ManifestAmbiguousKeyOut,
     ManifestAuditEntryOut,
@@ -819,4 +835,105 @@ def run_relocation_preview(
     )
     return RelocationPreviewResponse(
         target="windows", entries=entries_out, summary=summary
+    )
+
+
+def run_hardlink_order(request: HardlinkOrderRequest) -> HardlinkOrderResponse:
+    """硬链接解包顺序预演：规范化 → 同键/祖先阻断 → 目标链追踪与阻断传播
+    → 依赖排序（纯内存，不访问文件系统）。
+
+    路径不安全等问题不返回 422，而逐条列为阻断原因；结构性输入错误
+    （hardlink 缺 target、file/directory 带 target）已在 schema 层以 422 拒绝。
+    """
+    raw = [
+        (e.type.value, e.path, e.target) for e in request.entries
+    ]
+    planned, cycles, scheduled = plan_hardlink_order(raw)
+    order_of = {index: pos for pos, index in enumerate(scheduled, start=1)}
+
+    entries_out: list[HardlinkOrderEntryOut] = []
+    for entry in planned:
+        chain_steps: list[HardlinkChainStepOut] = []
+        final_file_index: int | None = None
+        if entry.entry_type == HARDLINK_TYPE:
+            trace = entry.trace
+            for step_no, node in enumerate(trace.nodes, start=1):
+                chain_steps.append(
+                    HardlinkChainStepOut(
+                        step=step_no,
+                        index=node.index,
+                        type=HardlinkEntryType(node.entry_type),
+                        canonical_path=node.canonical_path,
+                    )
+                )
+            if not entry.blocked and trace.resolves_to_file:
+                final_file_index = trace.terminal_index
+        elif entry.entry_type == FILE_TYPE and not entry.blocked:
+            final_file_index = entry.index
+
+        blocks_sorted = sorted(
+            entry.blocks.values(),
+            key=lambda block: BLOCK_CODE_ORDER[block.code],
+        )
+        entries_out.append(
+            HardlinkOrderEntryOut(
+                index=entry.index,
+                type=HardlinkEntryType(entry.entry_type),
+                original_path=entry.original_path,
+                target=entry.target,
+                canonical_path=entry.canonical_path,
+                target_canonical_path=(
+                    entry.target_normalized.canonical_path
+                    if entry.entry_type == HARDLINK_TYPE
+                    else None
+                ),
+                comparison_key=entry.comparison_key,
+                status=(
+                    HardlinkStatus.BLOCKED if entry.blocked else HardlinkStatus.EXECUTABLE
+                ),
+                blocks=[
+                    HardlinkBlockOut(
+                        code=block.code,
+                        message=block.message,
+                        related_indices=list(block.related_indices),
+                    )
+                    for block in blocks_sorted
+                ],
+                target_chain=chain_steps,
+                final_file_index=final_file_index,
+                execution_order=order_of.get(entry.index),
+            )
+        )
+
+    cycles_out = [
+        HardlinkCycleOut(members=list(members))
+        for members in sorted(cycles, key=lambda m: min(m))
+    ]
+
+    def _count(entry_type: str, blocked: bool) -> int:
+        return sum(
+            1
+            for e in planned
+            if e.entry_type == entry_type and (e.blocked == blocked)
+        )
+
+    blocked_total = sum(1 for e in planned if e.blocked)
+    summary = HardlinkOrderSummary(
+        total=len(planned),
+        files=sum(1 for e in planned if e.entry_type == FILE_TYPE),
+        directories=sum(1 for e in planned if e.entry_type == DIR_TYPE),
+        hardlinks=sum(1 for e in planned if e.entry_type == HARDLINK_TYPE),
+        executable=len(planned) - blocked_total,
+        blocked=blocked_total,
+        executable_files=_count(FILE_TYPE, False),
+        executable_directories=_count(DIR_TYPE, False),
+        executable_hardlinks=_count(HARDLINK_TYPE, False),
+        cycles=len(cycles_out),
+    )
+    return HardlinkOrderResponse(
+        target="windows",
+        entries=entries_out,
+        cycles=cycles_out,
+        execution_order=scheduled,
+        summary=summary,
     )
